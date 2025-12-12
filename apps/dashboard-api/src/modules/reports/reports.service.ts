@@ -59,7 +59,6 @@ export class ReportsService {
 
             // Planga ko‘ra qancha kun ishlashi kerak
             const totalPlannedDays = this.countPlannedDays(startDate, endDate, planWeekdays);
-
             // Rejada ishlashi shart bo‘lgan umumiy soatlar
             const totalHoursPlan = planDailyMinutes * totalPlannedDays;
 
@@ -92,8 +91,20 @@ export class ReportsService {
                 const dateStr = cursor.toISOString().slice(0, 10);
                 const weekdayName = cursor.toLocaleDateString('en-EN', { weekday: 'long' });
 
+                const weekdayMap: Record<string, number> = {
+                    Monday: 1,
+                    Tuesday: 2,
+                    Wednesday: 3,
+                    Thursday: 4,
+                    Friday: 5,
+                    Saturday: 6,
+                    Sunday: 7,
+                };
+
+                const plannedDays = planWeekdays.split(',').map(d => weekdayMap[d.trim()]);
+
                 const weekday = cursor.getDay() === 0 ? 7 : cursor.getDay();
-                const isWorkingDay = planWeekdays.split(',').map(Number).includes(weekday);
+                const isWorkingDay = plannedDays.includes(weekday);
 
                 const att = attendances.find(
                     a => a.startTime && a.startTime.toISOString().slice(0, 10) === dateStr
@@ -135,6 +146,7 @@ export class ReportsService {
 
                     // ➤ Dam olish kuni → overtimePlan
                     if (!isWorkingDay) {
+                        // console.log('overtimePlan added:', worked);
                         overtimePlan += worked;
                     } else {
                         onTimeMinutes += Math.min(worked, planDailyMinutes);
@@ -184,22 +196,22 @@ export class ReportsService {
         return results;
     }
 
-    // private getWeekdayRange(raw: string): string {
-    //     if (!raw) return '';
-
-    //     const array = raw.split(',').map(s => s.trim());
-
-    //     return `${array[0].slice(0, 3)}–${array[array.length - 1].slice(0, 3)}`;
-    // }
-
     private getWeekdayRange(raw: string): string {
         if (!raw) return '';
-        const arr = raw
-            .split(',')
-            .map(Number)
-            .sort((a, b) => a - b);
-        return `${arr[0].toString().slice(0, 3)}–${arr[arr.length - 1].toString().slice(0, 3)}`;
+
+        const array = raw.split(',').map(s => s.trim());
+
+        return `${array[0].slice(0, 3)}–${array[array.length - 1].slice(0, 3)}`;
     }
+
+    // private getWeekdayRange(raw: string): string {
+    //     if (!raw) return '';
+    //     const arr = raw
+    //         .split(',')
+    //         .map(Number)
+    //         .sort((a, b) => a - b);
+    //     return `${arr[0].toString().slice(0, 3)}–${arr[arr.length - 1].toString().slice(0, 3)}`;
+    // }
 
     private toMinutes(time: string): number {
         const [h, m] = time?.split(':').map(Number);
@@ -220,17 +232,34 @@ export class ReportsService {
     }
 
     private countPlannedDays(start: string, end: string, raw: string): number {
-        const plan = raw.split(',').map(Number);
-        let count = 0;
-        const cur = new Date(start);
+        // Hafta kunlari mapping
+        const map: Record<string, number> = {
+            Monday: 1,
+            Tuesday: 2,
+            Wednesday: 3,
+            Thursday: 4,
+            Friday: 5,
+            Saturday: 6,
+            Sunday: 7,
+        };
 
+        // Raw string -> raqam kunlar
+        const plan = raw.split(',').map(w => map[w.trim()]);
+
+        let count = 0;
+
+        const cur = new Date(start);
         const endDate = new Date(end);
 
         while (cur <= endDate) {
-            const day = cur?.getDay() === 0 ? 7 : cur?.getDay();
+            const jsDay = cur.getDay();
+            const day = jsDay === 0 ? 7 : jsDay; // Sunday → 7
+
             if (plan.includes(day)) count++;
-            cur?.setDate(cur?.getDate() + 1);
+
+            cur.setDate(cur.getDate() + 1);
         }
+
         return count;
     }
 }
