@@ -119,11 +119,19 @@ export class CredentialService {
     ): Promise<CredentialWithRelations> {
         const existing = await this.getCredentialById(id, scope, user);
         const employee = await this.getEmployee(existing.employeeId, scope, user);
-
-        this.validatePhoto(dto.type ?? existing.type, dto.additionalDetails);
+        const additionalDetails = dto.additionalDetails ?? existing.additionalDetails;
+        this.validatePhoto(dto.type ?? existing.type, additionalDetails);
         await this.validateUniqueCode(dto.type ?? existing.type, dto.code, id);
 
         await this.syncDevices(employee, existing, dto);
+
+        if (dto.isActive === false) {
+            await this.syncDevices(employee, existing, dto, 'Delete');
+        }
+
+        if (dto.isActive === true) {
+            await this.syncDevices(employee, existing, dto, 'Create');
+        }
 
         if (dto.isActive && this.shouldDeactivate(dto.type)) {
             await this.deactivateOld(employee.id, dto.type, id);
