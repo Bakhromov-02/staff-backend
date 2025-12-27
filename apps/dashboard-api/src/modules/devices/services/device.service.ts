@@ -2,12 +2,14 @@ import { Injectable, NotFoundException, BadRequestException } from '@nestjs/comm
 import { DataScope, UserContext } from '@app/shared/auth';
 import {
     AssignEmployeesToGatesDto,
+    ConnectionDto,
     CreateDeviceDto,
     QueryDeviceDto,
+    SyncCredentialsDto,
     UpdateDeviceDto,
 } from '../dto/device.dto';
 import { DeviceRepository } from '../repositories/device.repository';
-import { DeviceType, EntryType, Prisma } from '@prisma/client';
+import { ActionType, EntryType, Prisma, StatusEnum } from '@prisma/client';
 import { GateRepository } from '../../gate/repositories/gate.repository';
 import { HikvisionConfig } from '../../hikvision/dto/create-hikvision-user.dto';
 import { ConfigService } from 'apps/dashboard-api/src/core/config/config.service';
@@ -17,6 +19,7 @@ import { JOB } from 'apps/dashboard-api/src/shared/constants';
 import { EncryptionService } from 'apps/dashboard-api/src/shared/services/encryption.service';
 import { GateDto } from '../../gate/dto/gate.dto';
 import { HikvisionAccessService } from '../../hikvision/services/hikvision.access.service';
+import { PrismaService } from '@app/shared/database';
 
 @Injectable()
 export class DeviceService {
@@ -26,11 +29,21 @@ export class DeviceService {
         private readonly gateRepository: GateRepository,
         private hikvisionService: HikvisionAccessService,
         private readonly configService: ConfigService,
-        private readonly encryptionService: EncryptionService
+        private readonly encryptionService: EncryptionService,
+        private readonly prisma: PrismaService
     ) {}
 
     async findAll(query: QueryDeviceDto, scope: DataScope, user: UserContext) {
-        const { page, limit, sort = 'createdAt', order = 'desc', search, type, gateId } = query;
+        const {
+            page,
+            limit,
+            sort = 'createdAt',
+            order = 'desc',
+            search,
+            deviceTypes,
+            gateId,
+            isConnected,
+        } = query;
         const where: Prisma.DeviceWhereInput = {};
 
         if (search) {
@@ -40,8 +53,16 @@ export class DeviceService {
             ];
         }
 
-        if (type) {
-            where.type = type;
+        if (deviceTypes) {
+            where.type = { hasSome: deviceTypes };
+        }
+
+        if (isConnected) {
+            where.gateId = { not: null };
+        }
+
+        if (isConnected === false) {
+            where.gateId = null;
         }
 
         if (gateId) {
@@ -164,7 +185,7 @@ export class DeviceService {
             ipAddress: ipAddress,
             login: dtoData.login,
             password: dtoData.password,
-            type: dtoData.type,
+            type: dtoData.deviceTypes,
             entryType: dtoData.entryType || EntryType.BOTH,
             welcomeText: dtoData.welcomeText || null,
             welcomeTextType: dtoData.welcomeTextType || null,
@@ -194,55 +215,96 @@ export class DeviceService {
             scope
         );
 
-        const job = await this.deviceQueue.add(JOB.DEVICE.CREATE, {
-            hikvisionConfig,
-            newDevice: newDevice,
-            gateId,
-            scope,
-        });
+        if (gateId) {
+            await this.deviceQueue.add(JOB.DEVICE.CREATE, {
+                hikvisionConfig,
+                newDevice: newDevice,
+                gateId,
+                scope,
+            });
+        }
 
         return newDevice;
     }
 
     async update(id: number, updateDeviceDto: UpdateDeviceDto, scope: DataScope) {
-        await this.findOne(id, scope);
+        // 1. Amaldagi qurilmani bazadan olamiz (Solishtirish uchun)
+        const currentDevice = await this.findOne(id, scope);
 
-        const { gateId, ipAddress, ...dtoData } = updateDeviceDto;
+        const { gateId, ipAddress, deviceTypes, ...dtoData } = updateDeviceDto;
 
-        if (gateId && ipAddress) {
-            const existing = await this.deviceRepository.findOneByGateAndIp(gateId, ipAddress);
-            if (existing && existing.id !== id) {
-                throw new BadRequestException(
-                    'This gate already has a device with the same IP address'
+        // 2. IP manzili va Gate kombinatsiyasi band emasligini tekshirish
+        if (gateId || ipAddress) {
+            const checkIp = ipAddress || currentDevice.ipAddress;
+            const checkGate = gateId !== undefined ? gateId : currentDevice.gateId;
+
+            if (checkIp && checkGate) {
+                const collision = await this.deviceRepository.findOneByGateAndIp(
+                    checkGate,
+                    checkIp
                 );
+                if (collision && collision.id !== id) {
+                    throw new BadRequestException(
+                        'This gate already has a device with the same IP address'
+                    );
+                }
             }
         }
 
+        // 3. Yangi Gate mavjudligini tekshirish
         if (gateId) {
             const gate = await this.gateRepository.findById(gateId, {}, scope);
-            if (!gate) {
-                throw new NotFoundException('Gate not found');
-            }
+            if (!gate) throw new NotFoundException('Gate not found');
         }
 
-        return this.deviceRepository.update(
+        // 4. Bazada yangilash
+        const updatedDevice = await this.deviceRepository.update(
             id,
             {
                 ...dtoData,
-                ...(updateDeviceDto.gateId !== undefined && {
+                type: deviceTypes,
+                ...(gateId !== undefined && {
                     gate: gateId ? { connect: { id: gateId } } : { disconnect: true },
                 }),
             },
             {
-                gate: {
-                    select: {
-                        id: true,
-                        name: true,
-                    },
-                },
+                gate: { select: { id: true, name: true } },
             },
             scope
         );
+
+        if (gateId !== undefined && gateId !== currentDevice.gateId) {
+            if (currentDevice.gateId) {
+                const oldGate = await this.gateRepository.findById(currentDevice.gateId, {
+                    employees: true,
+                });
+
+                if (oldGate?.employees?.length) {
+                    await this.deviceQueue.add(JOB.DEVICE.CLEAR_ALL_USERS_FROM_DEVICE, {
+                        deviceId: id,
+                    });
+                }
+            }
+
+            if (gateId) {
+                const hikvisionConfig: HikvisionConfig = {
+                    host: updatedDevice.ipAddress,
+                    port: 80,
+                    username: updatedDevice.login,
+                    password: updatedDevice.password,
+                    protocol: 'http',
+                };
+
+                await this.deviceQueue.add(JOB.DEVICE.CREATE, {
+                    hikvisionConfig,
+                    newDevice: updatedDevice,
+                    gateId,
+                    scope,
+                });
+            }
+        }
+
+        return updatedDevice;
     }
 
     async remove(id: number, scope: DataScope, user: UserContext) {
@@ -262,27 +324,23 @@ export class DeviceService {
             throw new NotFoundException('Device not found');
         }
 
-        await this.deviceRepository.update(id, {
-            gate: {
-                disconnect: { id: device?.gateId },
-            },
-        });
+        if (device.gateId) {
+            await this.deviceRepository.update(id, {
+                gate: {
+                    disconnect: { id: device?.gateId },
+                },
+            });
+        }
 
-        const config: HikvisionConfig = {
-            host: device.ipAddress,
-            port: 80,
-            username: device.login,
-            password: device.password,
-            protocol: device.protocol || 'http',
-        };
+        const deviceId = device.id;
 
-        const job = await this.deviceQueue.add(JOB.DEVICE.DELETE, { device, config });
+        const job = await this.deviceQueue.add(JOB.DEVICE.DELETE, { deviceId });
 
         const result = await this.deviceRepository.softDelete(id, scope);
         return { message: 'Device deleted successfully', ...result };
     }
 
-    async findByType(type: DeviceType) {
+    async findByType(type: ActionType) {
         return this.deviceRepository.findByType(type);
     }
 
@@ -319,6 +377,55 @@ export class DeviceService {
         return { success: true };
     }
 
+    async connectGateToDevices(dto: ConnectionDto, scope: DataScope) {
+        const { gateId, deviceIds } = dto;
+
+        const gate = await this.gateRepository.findById(gateId);
+        if (!gate) {
+            throw new NotFoundException('Gate not found');
+        }
+
+        const devices = await this.deviceRepository.findMany(
+            { id: { in: deviceIds } },
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            scope
+        );
+
+        for (const device of devices) {
+            let { id } = device;
+            await this.deviceRepository.update(
+                id,
+                {
+                    gate: {
+                        connect: { id: gateId },
+                    },
+                },
+                {},
+                scope
+            );
+
+            const hikvisionConfig: HikvisionConfig = {
+                host: device.ipAddress,
+                port: 80,
+                username: device.login,
+                password: device.password,
+                protocol: 'http',
+            };
+
+            await this.deviceQueue.add(JOB.DEVICE.CREATE, {
+                hikvisionConfig,
+                newDevice: device,
+                gateId,
+                scope,
+            });
+        }
+
+        return { success: true, connectedCount: devices.length };
+    }
+
     async unlockDoor(deviceId: number, doorNo: number = 1, scope?: DataScope) {
         try {
             const device = await this.deviceRepository.findById(deviceId, {}, scope);
@@ -344,5 +451,69 @@ export class DeviceService {
         } catch (error) {
             throw error;
         }
+    }
+
+    async getEmployeeGateCredentials(gateId: number, employeeId: number, scope: DataScope) {
+        const allCredentials = await this.prisma.credential.findMany({
+            where: { employeeId, isActive: true, deletedAt: null },
+        });
+
+        if (!gateId || !employeeId) {
+            throw new BadRequestException('gateId and employeeId required!');
+        }
+
+        const activeSyncs = await this.prisma.employeeSync.findMany({
+            where: {
+                gateId,
+                employeeId,
+                deletedAt: null,
+                status: StatusEnum.DONE,
+            },
+            select: { credentialId: true },
+        });
+
+        const syncedIds = activeSyncs.map(s => s.credentialId);
+
+        return allCredentials.map(cred => ({
+            ...cred,
+            isAssignedToGate: syncedIds.includes(cred.id),
+        }));
+    }
+
+    async updateEmployeeGateAccessByIds(dto: {
+        gateId: number;
+        employeeId: number;
+        credentialIds: number[];
+    }) {
+        const { gateId, employeeId, credentialIds } = dto;
+
+        const currentSyncs = await this.prisma.employeeSync.findMany({
+            where: { gateId, employeeId, deletedAt: null },
+        });
+        const currentSyncedCredIds = currentSyncs.map(s => s.credentialId);
+
+        const toRemoveIds = currentSyncedCredIds.filter(id => !credentialIds.includes(id));
+        const toAddIds = credentialIds.filter(id => !currentSyncedCredIds.includes(id));
+
+        // 1. O'CHIRISH - Avvalgi removeSpecificCredentialsJob'ni ishlataveramiz
+        if (toRemoveIds.length > 0) {
+            await this.deviceQueue.add(JOB.DEVICE.REMOVE_SPECIFIC_CREDENTIALS, {
+                gateId,
+                employeeId,
+                credentialIds: toRemoveIds,
+            });
+        }
+
+        // 2. QO'SHISH - Yangi, xavfsiz job
+        if (toAddIds.length > 0) {
+            await this.deviceQueue.add(JOB.DEVICE.SYNC_CREDENTIALS_TO_DEVICES, {
+                // <-- Yangi job nomi
+                gateId,
+                employeeId,
+                credentialIds: toAddIds,
+            });
+        }
+
+        return { success: true };
     }
 }

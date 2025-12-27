@@ -1,8 +1,4 @@
-import { EmployeeWithRelations } from '../../employee/repositories/employee.repository';
 import { EmployeeService } from '../../employee/services/employee.service';
-import { HikvisionConfig } from '../../hikvision/dto/create-hikvision-user.dto';
-import { HikvisionAccessService } from '../../hikvision/services/hikvision.access.service';
-import { HikvisionAnprService } from '../../hikvision/services/hikvision.anpr.service';
 import {
     CreateCredentialDto,
     CredentialQueryDto,
@@ -15,14 +11,25 @@ import {
 import { ActionType, Prisma } from '@prisma/client';
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DataScope, UserContext } from '@app/shared/auth';
+import { LoggerService } from 'apps/dashboard-api/src/core/logger';
+import { EmployeeWithRelations } from '../../employee/repositories/employee.repository';
+import { HikvisionConfig } from '../../hikvision/dto/create-hikvision-user.dto';
+import { HikvisionAnprService } from '../../hikvision/services/hikvision.anpr.service';
+import { HikvisionAccessService } from '../../hikvision/services/hikvision.access.service';
 
 @Injectable()
 export class CredentialService {
+    private readonly CAR = ActionType.CAR;
+    private readonly CARD = ActionType.CARD;
+    private readonly PHOTO = ActionType.PHOTO;
+    private readonly QR = ActionType.QR;
+    private readonly PERSONAL_CODE = ActionType.PERSONAL_CODE;
     constructor(
         private readonly credentialRepository: CredentialRepository,
         private readonly employeeService: EmployeeService,
         private readonly hikvisionAnprService: HikvisionAnprService,
-        private readonly hikvisionAccessService: HikvisionAccessService
+        private readonly hikvisionAccessService: HikvisionAccessService,
+        private readonly logger: LoggerService
     ) {}
 
     async getAllCredentials(query: CredentialQueryDto, scope: DataScope) {
@@ -119,32 +126,35 @@ export class CredentialService {
     ): Promise<CredentialWithRelations> {
         const existing = await this.getCredentialById(id, scope, user);
         const employee = await this.getEmployee(existing.employeeId, scope, user);
-        const additionalDetails = dto.additionalDetails ?? existing.additionalDetails;
-        this.validatePhoto(dto.type ?? existing.type, additionalDetails);
-        await this.validateUniqueCode(dto.type ?? existing.type, dto.code, id);
 
-        await this.syncDevices(employee, existing, dto);
+        const finalType = dto.type ?? existing.type;
+        const finalCode = dto.code ?? existing.code;
+        const finalDetails = dto.additionalDetails ?? existing.additionalDetails;
 
-        if (dto.isActive === false) {
+        // Validatsiyalar
+        this.validatePhoto(finalType, finalDetails);
+        await this.validateUniqueCode(finalCode ? finalType : null, finalCode, id);
+
+        // Sinxronizatsiya logikasi
+        if (dto.isActive === false && existing.isActive === true) {
+            // Bloklandi -> Qurilmadan o'chiramiz
             await this.syncDevices(employee, existing, dto, 'Delete');
-        }
-
-        if (dto.isActive === true) {
+        } else if (dto.isActive === true && existing.isActive === false) {
+            // Faollashdi -> Qurilmaga yuboramiz
             await this.syncDevices(employee, existing, dto, 'Create');
+        } else if (existing.isActive) {
+            // Shunchaki ma'lumot o'zgardi (Masalan, moshina raqami o'zgardi)
+            await this.syncDevices(employee, existing, dto, 'Edit');
         }
 
-        if (dto.isActive && this.shouldDeactivate(dto.type)) {
-            await this.deactivateOld(employee.id, dto.type, id);
+        // "Faqat bitta faol foto/parol" qoidasi
+        if (dto.isActive && this.shouldDeactivate(finalType)) {
+            await this.deactivateOld(employee.id, finalType, id);
         }
 
         return this.credentialRepository.update(
             id,
-            {
-                code: dto.code,
-                type: dto.type,
-                additionalDetails: dto.additionalDetails,
-                isActive: dto.isActive,
-            },
+            dto,
             this.credentialRepository.getDefaultInclude(),
             scope
         );
@@ -165,14 +175,16 @@ export class CredentialService {
     }
 
     private validatePhoto(type: string, details?: string) {
-        if (type === 'PHOTO' && !details) {
+        if (type === this.PHOTO && !details) {
             throw new BadRequestException('Employee photo is missing.');
         }
     }
 
     private async validateUniqueCode(type: ActionType, code?: string, excludeId?: number) {
         if (!code) return;
-        if (!['CAR', 'PERSONAL_CODE', 'QR', 'CARD'].includes(type)) return;
+        if (!([this.CAR, this.PERSONAL_CODE, this.QR, this.CARD] as ActionType[]).includes(type)) {
+            return;
+        }
 
         const exists = await this.credentialRepository.findFirst(
             { code, ...(excludeId && { id: { not: excludeId } }) },
@@ -184,8 +196,8 @@ export class CredentialService {
         }
     }
 
-    private shouldDeactivate(type: string, isActive = true) {
-        return isActive && ['PHOTO', 'PERSONAL_CODE'].includes(type);
+    private shouldDeactivate(type: ActionType, isActive = true) {
+        return isActive && ([this.PHOTO, this.PERSONAL_CODE] as ActionType[]).includes(type);
     }
 
     private async deactivateOld(employeeId: number, type: ActionType, excludeId?: number) {
@@ -202,7 +214,7 @@ export class CredentialService {
 
     private async syncDevices(
         employee: EmployeeWithRelations,
-        oldCredential: CreateCredentialDto,
+        oldCredential: CreateCredentialDto, // Faqat kerakli maydonlar
         dto?: UpdateCredentialDto,
         action: 'Create' | 'Edit' | 'Delete' = 'Edit'
     ) {
@@ -210,8 +222,9 @@ export class CredentialService {
         const code = dto?.code ?? oldCredential.code;
         const faceUrl = dto?.additionalDetails ?? oldCredential.additionalDetails;
 
-        const devices = employee.gates.flatMap(g =>
-            g.devices.filter(d => this.isDeviceCompatible(type, d.type))
+        // Qurilmalarni filtrlaymiz
+        const devices = employee.gates.flatMap(
+            g => g.devices.filter(d => d.type.includes(type)) // To'g'ridan-to'g'ri massivni tekshiramiz
         );
 
         for (const device of devices) {
@@ -224,22 +237,21 @@ export class CredentialService {
             };
 
             try {
-                await this.handleDeviceAction(type, action, employee, code, faceUrl, config);
+                await this.handleDeviceAction(
+                    type,
+                    action,
+                    employee,
+                    code,
+                    faceUrl,
+                    config,
+                    oldCredential
+                );
             } catch (e) {
-                console.error(`[${type}] device sync error:`, e.message);
+                this.logger.error(
+                    `[${type}] device sync error on Device ${device.id}: ${e.message}`
+                );
             }
         }
-    }
-
-    private isDeviceCompatible(credType: string, deviceType: string) {
-        const map = {
-            CAR: ['CAR'],
-            PHOTO: ['FACE', 'ACCESS_CONTROL'],
-            PERSONAL_CODE: ['FACE', 'ACCESS_CONTROL'],
-            CARD: ['FACE', 'ACCESS_CONTROL'],
-            QR: ['FACE', 'ACCESS_CONTROL'],
-        };
-        return map[credType]?.includes(deviceType);
     }
 
     private async handleDeviceAction(
@@ -251,38 +263,44 @@ export class CredentialService {
         config: HikvisionConfig,
         oldCredential?: CreateCredentialDto
     ) {
-        if (type == 'QR') {
-            type = 'CARD';
-        }
+        // Agar QR bo'lsa, Hikvision ISAPI interfeysida u Card ID sifatida yuboriladi
+        const effectiveType = type === ActionType.QR ? ActionType.CARD : type;
 
-        switch (type) {
-            case 'CAR':
+        switch (effectiveType) {
+            case ActionType.CAR:
                 if (action === 'Delete')
                     return this.hikvisionAnprService.deleteLicensePlate(code, config);
                 if (action === 'Create')
                     return this.hikvisionAnprService.addLicensePlate(code, '1', config);
-                return this.hikvisionAnprService.editLicensePlate(code, code, '1', config);
+                return this.hikvisionAnprService.editLicensePlate(
+                    oldCredential?.code || code,
+                    code,
+                    '1',
+                    config
+                );
 
-            case 'PHOTO':
+            case ActionType.PHOTO:
                 if (action === 'Delete')
                     return this.hikvisionAccessService.deleteFaceFromUser(
                         String(employee.id),
                         config
                     );
+
+                // Yuz qo'shishdan oldin foydalanuvchi borligini tekshirish/yaratish HikvisionAccessService ichida bo'lishi kerak
                 return this.hikvisionAccessService.addFaceToUserViaURL(
                     String(employee.id),
                     faceUrl,
                     config
                 );
 
-            case 'PERSONAL_CODE':
+            case ActionType.PERSONAL_CODE:
                 return this.hikvisionAccessService.addPasswordToUser(
                     String(employee.id),
                     action === 'Delete' ? '' : code,
                     config
                 );
 
-            case 'CARD':
+            case ActionType.CARD:
                 if (action === 'Delete')
                     return this.hikvisionAccessService.deleteCard({
                         employeeNo: String(employee.id),
@@ -295,8 +313,9 @@ export class CredentialService {
                         cardNo: code,
                         config,
                     });
+
                 return this.hikvisionAccessService.replaceCard(
-                    oldCredential.code,
+                    oldCredential?.code || code,
                     code,
                     String(employee.id),
                     config

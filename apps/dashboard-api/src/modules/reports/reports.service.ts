@@ -9,6 +9,7 @@ import {
     AttendanceStats,
 } from './dto/reports.dto';
 import { DataScope, UserContext } from '@app/shared/auth';
+import { Attendance } from '@prisma/client';
 
 @Injectable()
 export class ReportsService {
@@ -21,199 +22,150 @@ export class ReportsService {
     ): Promise<AttendanceReportData> {
         const { departmentId, startDate, endDate, organizationId } = dto;
 
-        const depId = (scope?.departmentIds ?? [departmentId]).filter(Boolean);
+        const depIds = (scope?.departmentIds ?? [departmentId]).filter(Boolean);
         const orgId = scope?.organizationId ?? organizationId;
 
-        if (!orgId) {
-            throw new BadRequestException('Please enter organizationId');
-        }
+        if (!orgId) throw new BadRequestException('Please enter organizationId');
 
         const start = new Date(startDate);
         start.setHours(0, 0, 0, 0);
-
         const end = new Date(endDate);
         end.setHours(23, 59, 59, 999);
 
         const employees = await this.prisma.employee.findMany({
             where: {
-                ...(depId.length > 0 ? { departmentId: { in: depId } } : {}),
+                ...(depIds.length > 0 ? { departmentId: { in: depIds } } : {}),
                 organizationId: orgId,
                 deletedAt: null,
             },
-            include: {
-                department: true,
-                job: true,
-                plan: true,
-            },
+            include: { department: true, job: true, plan: true },
         });
+
+        const dateData: AttendanceDateData[] = [];
+        const tempCursor = new Date(start);
+        while (tempCursor <= end) {
+            const dateStr = tempCursor.toLocaleDateString('en-CA', {
+                timeZone: 'Asia/Tashkent',
+                month: '2-digit',
+                day: '2-digit',
+            });
+
+            const weekday = tempCursor.toLocaleDateString('en-EN', {
+                weekday: 'short',
+                timeZone: 'Asia/Tashkent',
+            });
+
+            dateData.push({
+                date: dateStr,
+                weekday,
+            });
+
+            tempCursor.setDate(tempCursor.getDate() + 1);
+        }
 
         const results: AttendanceMainReportData[] = [];
 
-        const dateData: AttendanceDateData[] = [];
-
-        const cursor = new Date(startDate);
-        while (cursor <= end) {
-            dateData.push({
-                date: cursor.toISOString().slice(5, 10),
-                weekday: cursor.toLocaleDateString('en-EN', { weekday: 'short' }),
-            });
-            cursor.setDate(cursor.getDate() + 1);
-        }
-
         for (const emp of employees) {
-            const plan = emp.plan;
-            const planStart = plan?.startTime;
-            const planEnd = plan?.endTime;
-            const planWeekdays = plan?.weekdays || '';
-
-            const planStartMin = this.toMinutes(planStart);
-            const planEndMin = this.toMinutes(planEnd);
-            const planDailyMinutes = planEndMin - planStartMin;
-
-            const planRange = this.getWeekdayRange(planWeekdays);
-
-            // Planga ko‘ra qancha kun ishlashi kerak
-            const totalPlannedDays = this.countPlannedDays(startDate, endDate, planWeekdays);
-            // Rejada ishlashi shart bo‘lgan umumiy soatlar
-            const totalHoursPlan = planDailyMinutes * totalPlannedDays;
-
-            // Attendance records
             const attendances = await this.prisma.attendance.findMany({
-                where: {
-                    employeeId: emp.id,
-                    createdAt: { gte: start, lte: end },
-                },
+                where: { employeeId: emp.id, createdAt: { gte: start, lte: end } },
                 orderBy: { createdAt: 'asc' },
             });
-            // Statistika yig‘iladigan joy
+
+            const daysStatistics: (typeof results)[number]['daysStatistics'] = [];
+
             let totalWorked = 0;
             let totalLate = 0;
             let totalEarly = 0;
-            let onTimeMinutes = 0;
+            let onTime = 0;
             let overtime = 0;
             let overtimePlan = 0;
             let totalDays = 0;
             let reasonableAbsent = 0;
             let unreasonableAbsent = 0;
+            let totalPlanned = 0;
 
-            const daysStatistics = [];
+            const attendanceMap = new Map<string, Attendance>();
 
-            // Kalendar bo‘yicha yuramiz
-            const cursor = new Date(startDate);
-
-            while (cursor <= end) {
-                const dateStr = cursor.toISOString().slice(0, 10);
-                const weekdayName = cursor.toLocaleDateString('en-EN', { weekday: 'long' });
-
-                const weekdayMap: Record<string, number> = {
-                    Monday: 1,
-                    Tuesday: 2,
-                    Wednesday: 3,
-                    Thursday: 4,
-                    Friday: 5,
-                    Saturday: 6,
-                    Sunday: 7,
-                };
-
-                const plannedDays = planWeekdays.split(',').map(d => weekdayMap[d.trim()]);
-
-                const weekday = cursor.getDay() === 0 ? 7 : cursor.getDay();
-                const isWorkingDay = plannedDays.includes(weekday);
-
-                const att = attendances.find(a => {
-                    if (!a.startTime) return false;
-
-                    const localDate = new Date(a.startTime);
-                    localDate.setHours(localDate.getHours() + 5);
-
-                    return localDate.toISOString().slice(0, 10) === dateStr;
+            for (const att of attendances) {
+                const key = att.createdAt.toLocaleDateString('en-CA', {
+                    timeZone: 'Asia/Tashkent',
+                    month: '2-digit',
+                    day: '2-digit',
                 });
-
-                if (!att) {
-                    // ➤ Ish kuni – lekin yo‘q → ABSENT
-                    if (isWorkingDay) {
-                        unreasonableAbsent += planDailyMinutes;
-                        daysStatistics.push({
-                            weekDay: weekdayName,
-                            status: 'ABSENT',
-                            totalHours: '0',
-                        });
-                    } else {
-                        // ➤ Dam olish kuni
-                        daysStatistics.push({
-                            weekDay: weekdayName,
-                            status: 'WEEKEND',
-                            totalHours: '0',
-                        });
-                    }
-                } else {
-                    totalDays++;
-
-                    const startT = att.startTime;
-                    const endT = att.endTime;
-                    const worked = this.diffMinutes(startT, endT);
-
-                    totalWorked += worked;
-
-                    const late = att.lateArrivalTime || 0;
-                    const early = att.earlyGoneTime || 0;
-
-                    totalLate += late;
-                    totalEarly += early;
-
-                    if (isWorkingDay) {
-                        const absentMinutes = Math.max(planDailyMinutes - worked, 0);
-
-                        if (att.reasonTypeId || att.reason) {
-                            reasonableAbsent += absentMinutes;
-                        } else {
-                            unreasonableAbsent += absentMinutes;
-                        }
-
-                        onTimeMinutes += Math.min(worked, planDailyMinutes);
-
-                        if (worked > planDailyMinutes) {
-                            overtime += worked - planDailyMinutes;
-                        }
-                    } else {
-                        overtimePlan += worked;
-                    }
-
-                    daysStatistics.push({
-                        weekDay: weekdayName,
-                        status: att.arrivalStatus || 'ON_TIME',
-                        startTime: this.formatTime(startT),
-                        endTime: this.formatTime(endT),
-                        totalHours: this.formatHours(worked),
-                    });
-                }
-
-                cursor.setDate(cursor.getDate() + 1);
+                attendanceMap.set(key, att);
             }
 
-            // Yakuniy natijani qo‘shish
+            for (const d of dateData) {
+                const att = attendanceMap.get(d.date);
+
+                // 1️⃣ ATTENDANCE YO‘Q → WEEKEND
+                if (!att) {
+                    daysStatistics.push({
+                        status: 'WEEKEND',
+                        totalMinutes: 0,
+                    });
+                    continue;
+                }
+
+                totalDays++;
+
+                // 2️⃣ ISHLAGAN MINUTLAR
+                let worked = 0;
+                if (att.startTime && att.endTime) {
+                    worked = Math.floor((att.endTime.getTime() - att.startTime.getTime()) / 60000);
+                } else if (att.startTime) {
+                    worked = Math.floor((Date.now() - att.startTime.getTime()) / 60000);
+                }
+
+                const planned = att.plannedMinutes ?? 0;
+
+                totalWorked += worked;
+                totalLate += att.lateArrivalTime || 0;
+                totalEarly += att.earlyGoneTime || 0;
+                totalPlanned += planned;
+
+                if (att.isWorkingDay) {
+                    const absentMinutes = Math.max(planned - worked, 0);
+                    if (att.reasonId || att.reason) reasonableAbsent += absentMinutes;
+                    else unreasonableAbsent += absentMinutes;
+
+                    onTime += Math.min(worked, planned);
+                    if (worked > planned) overtime += worked - planned;
+                } else {
+                    overtimePlan += worked;
+                }
+
+                daysStatistics.push({
+                    status: att.isWorkingDay ? att.arrivalStatus : 'ON_TIME',
+                    startTime: att.startTime?.toISOString().slice(11, 16),
+                    endTime: att.endTime?.toISOString().slice(11, 16),
+                    totalMinutes: worked,
+                });
+            }
+
+            const week = this.getWeekdayRange(emp.plan.weekdays);
             results.push({
                 fio: emp.name,
                 position: emp.job?.eng,
                 department: emp.department.fullName,
-
-                workSchedule: `${planRange} (${planStart} - ${planEnd})`,
+                workSchedule: emp.plan
+                    ? `${week} (${emp.plan.startTime} - ${emp.plan.endTime})`
+                    : '',
                 daysStatistics,
 
-                totalHoursPlan: this.formatHours(totalHoursPlan),
-                totalHoursLate: this.formatHours(totalLate),
-                totalHoursEarly: this.formatHours(totalEarly),
-                totalWorkedHours: this.formatHours(totalWorked),
+                totalPlannedMinutes: totalPlanned,
+                totalLateMinutes: totalLate,
+                totalEarlyMinutes: totalEarly,
+                totalWorkedMinutes: totalWorked,
 
-                ontimeHours: this.formatHours(onTimeMinutes),
-                overtimeHours: this.formatHours(overtime),
+                onTimeMinutes: onTime,
+                overtimeMinutes: overtime,
+                overtimePlanMinutes: overtimePlan,
 
-                overtimePlanHours: this.formatHours(overtimePlan),
+                reasonableAbsentMinutes: reasonableAbsent,
+                unreasonableAbsentMinutes: unreasonableAbsent,
 
-                resonableAbsentHours: this.formatHours(reasonableAbsent),
-                unresaonableAbsentHours: this.formatHours(unreasonableAbsent),
-
-                total: this.formatHours(onTimeMinutes + overtime + overtimePlan),
+                totalMinutes: onTime + overtime + overtimePlan,
                 totalDays,
             });
         }
@@ -237,44 +189,6 @@ export class ReportsService {
     private diffMinutes(d1: Date, d2: Date): number {
         if (!d1 || !d2) return 0;
         return Math.floor((d2?.getTime() - d1?.getTime()) / 60000);
-    }
-
-    private formatHours(min: number): string {
-        return `${Math.floor(min / 60)}h ${min % 60}m`;
-    }
-
-    private formatTime(d: Date): string {
-        return d?.toTimeString().slice(0, 5);
-    }
-
-    private countPlannedDays(start: string, end: string, raw: string): number {
-        const map: Record<string, number> = {
-            Monday: 1,
-            Tuesday: 2,
-            Wednesday: 3,
-            Thursday: 4,
-            Friday: 5,
-            Saturday: 6,
-            Sunday: 7,
-        };
-
-        const plan = raw.split(',').map(w => map[w.trim()]);
-
-        let count = 0;
-
-        const cur = new Date(start);
-        const endDate = new Date(end);
-
-        while (cur <= endDate) {
-            const jsDay = cur.getDay();
-            const day = jsDay === 0 ? 7 : jsDay;
-
-            if (plan.includes(day)) count++;
-
-            cur.setDate(cur.getDate() + 1);
-        }
-
-        return count;
     }
 
     async getAttendanceStats(
@@ -302,8 +216,6 @@ export class ReportsService {
             },
         });
 
-        const workingDays = this.getWorkingDayNumbers(employee.plan?.weekdays || '');
-
         let totalArrivalMinutes = 0;
         let totalLeaveMinutes = 0;
         let totalWorkedMinutes = 0;
@@ -316,9 +228,7 @@ export class ReportsService {
         attendances.forEach(att => {
             if (!att.startTime) return;
 
-            let dayOfWeek = att.startTime.getDay();
-            if (dayOfWeek === 0) dayOfWeek = 7;
-            if (!workingDays.includes(dayOfWeek)) return;
+            if (!att.isWorkingDay) return;
 
             const arrival = new Date(att.startTime);
             totalArrivalMinutes += arrival.getHours() * 60 + arrival.getMinutes();
@@ -338,11 +248,11 @@ export class ReportsService {
 
         if (validArrivalCount === 0) {
             return {
-                averageArrivalTime: '--:--',
+                averageArrivalTime: 0,
                 avgArrivalEarlyMinutes: 0,
                 avgArrivalLateMinutes: 0,
 
-                averageLeaveTime: '--:--',
+                averageLeaveTime: 0,
                 avgLeaveEarlyMinutes: 0,
                 avgLeaveOvertimeMinutes: 0,
 
@@ -356,7 +266,12 @@ export class ReportsService {
         const avgLeaveMin =
             validLeaveEntries > 0 ? Math.round(totalLeaveMinutes / validLeaveEntries) : 0;
 
-        const planStartMin = this.toMinutes(employee.plan?.startTime || '09:00');
+        const minutes = this.addExtraTime(
+            employee.plan?.startTime,
+            employee.plan?.extraTime || '00:00'
+        );
+        const planStartMin = this.toMinutes(minutes || '09:00');
+
         const planEndMin = this.toMinutes(employee.plan?.endTime || '18:00');
 
         const arrivalDiff = planStartMin - avgArrivalMin;
@@ -378,11 +293,11 @@ export class ReportsService {
         }
 
         return {
-            averageArrivalTime: this.minutesToAmPm(avgArrivalMin),
+            averageArrivalTime: avgArrivalMin,
             avgArrivalEarlyMinutes,
             avgArrivalLateMinutes,
 
-            averageLeaveTime: validLeaveEntries > 0 ? this.minutesToAmPm(avgLeaveMin) : '--:--',
+            averageLeaveTime: validLeaveEntries > 0 ? avgLeaveMin : 0,
             avgLeaveEarlyMinutes,
             avgLeaveOvertimeMinutes,
 
@@ -392,39 +307,15 @@ export class ReportsService {
         };
     }
 
-    private minutesToAmPm(totalMinutes: number): string {
-        if (totalMinutes < 0) totalMinutes = 0;
+    private addExtraTime(startTime: string, extraTime: string): string {
+        const [sh, sm] = startTime.split(':').map(Number);
+        const [eh, em] = extraTime.split(':').map(Number);
 
-        let hours = Math.floor(totalMinutes / 60);
-        const minutes = totalMinutes % 60;
-        const ampm = hours >= 12 ? 'PM' : 'AM';
+        let minutes = sh * 60 + sm + eh * 60 + em;
 
-        hours = hours % 12;
-        hours = hours ? hours : 12;
+        const h = Math.floor(minutes / 60) % 24;
+        const m = minutes % 60;
 
-        const hStr = hours.toString().padStart(2, '0');
-        const mStr = minutes.toString().padStart(2, '0');
-
-        return `${hStr}:${mStr} ${ampm}`;
-    }
-
-    private getWorkingDayNumbers(weekdaysStr: string): number[] {
-        if (!weekdaysStr) return [];
-
-        const map: Record<string, number> = {
-            Monday: 1,
-            Tuesday: 2,
-            Wednesday: 3,
-            Thursday: 4,
-            Friday: 5,
-            Saturday: 6,
-            Sunday: 7,
-        };
-
-        return weekdaysStr
-            .split(',')
-            .map(day => day.trim())
-            .map(day => map[day])
-            .filter(num => num);
+        return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
     }
 }

@@ -8,6 +8,8 @@ import {
     UpdateDeviceDto,
     AssignEmployeesToGatesDto,
     QueryDeviceDto,
+    ConnectionDto,
+    SyncCredentialsDto,
 } from '../dto/device.dto';
 import { ApiCrudOperation } from 'apps/dashboard-api/src/shared/utils';
 
@@ -116,5 +118,35 @@ export class DeviceController {
     })
     async openDoor(@Param('id') id: number, @User() user: UserContext, @Scope() scope: DataScope) {
         return await this.deviceService.unlockDoor(id, 1, scope);
+    }
+
+    @Post('connectDevicesToGate')
+    @Roles(Role.ADMIN)
+    @ApiCrudOperation(ConnectionDto, 'create', {
+        body: ConnectionDto,
+        summary: 'Gate connect with devices',
+    })
+    async connectDevicesToGate(
+        @Body() dto: ConnectionDto,
+        @Scope() scope: DataScope,
+        @User() user: UserContext
+    ) {
+        return await this.deviceService.connectGateToDevices(dto, scope);
+    }
+
+    @Get('gate/:gateId/employee/:employeeId/credentials')
+    @Roles(Role.ADMIN)
+    async getEmployeeCredentialsStatus(
+        @Param('gateId') gateId: number,
+        @Param('employeeId') employeeId: number,
+        @Scope() scope: DataScope
+    ) {
+        return await this.deviceService.getEmployeeGateCredentials(gateId, employeeId, scope);
+    }
+
+    @Post('gate/sync-credentials')
+    @Roles(Role.ADMIN)
+    async syncCredentials(@Body() dto: SyncCredentialsDto, @Scope() scope: DataScope) {
+        return await this.deviceService.updateEmployeeGateAccessByIds(dto);
     }
 }

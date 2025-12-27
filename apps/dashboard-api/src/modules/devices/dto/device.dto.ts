@@ -11,8 +11,8 @@ import {
     IsNumber,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional, PartialType } from '@nestjs/swagger';
-import { DeviceType, EntryType, WelcomePhoto, WelcomeText } from '@prisma/client';
-import { Type } from 'class-transformer';
+import { ActionType, EntryType, WelcomePhoto, WelcomeText } from '@prisma/client';
+import { Transform, Type } from 'class-transformer';
 import { QueryDto } from 'apps/dashboard-api/src/shared/dto';
 
 export class CreateDeviceDto {
@@ -27,14 +27,15 @@ export class CreateDeviceDto {
     gateId?: number;
 
     @ApiProperty({
-        example: DeviceType.FACE,
-        description: 'Device type',
-        enum: DeviceType,
-        required: false,
+        example: [ActionType.PHOTO, ActionType.CARD],
+        description: 'Device Types',
+        enum: ActionType,
+        isArray: true,
     })
-    @IsOptional()
-    @IsEnum(DeviceType)
-    type?: DeviceType;
+    @IsArray()
+    @ArrayNotEmpty()
+    @IsEnum(ActionType, { each: true })
+    deviceTypes?: ActionType[];
 
     @ApiProperty({ example: '192.168.1.100', description: 'Device IP address', required: false })
     @IsOptional()
@@ -154,32 +155,38 @@ export class DeviceDto extends CreateDeviceDto {
     };
 }
 
-export class TestConnectionDto {
-    @ApiProperty({
-        example: 5,
-        description: 'Connection timeout in seconds',
-        required: false,
-        default: 5,
-    })
-    @IsOptional()
-    @IsInt()
-    timeout?: number = 5;
-}
-
-export class AssignEmployeesToGatesDto {
+export class ConnectionDto {
     @ApiProperty({
         example: [1, 2, 3],
-        description: 'Gate IDlar ro‘yxati',
+        description: 'Device IDlari ro‘yxati',
         type: [Number],
     })
     @IsArray()
     @ArrayNotEmpty()
     @IsInt({ each: true })
-    gateIds: number[];
+    deviceIds: number[];
+
+    @ApiProperty({
+        example: 1,
+        description: 'Gate ID (Bitta darvoza IDsi)',
+        type: Number,
+    })
+    @IsInt()
+    gateId: number; //
+}
+
+export class AssignEmployeesToGatesDto {
+    @ApiProperty({
+        example: 1,
+        description: 'Gate ID (Bitta darvoza IDsi)',
+        type: Number,
+    })
+    @IsInt()
+    gateId: number; // Nomini gateIds dan gateId ga o'zgartirdik (chunki u bitta son)
 
     @ApiProperty({
         example: [5, 6, 7],
-        description: 'Employee IDlar ro‘yxati',
+        description: 'Xodimlar IDlari ro‘yxati',
         type: [Number],
     })
     @IsArray()
@@ -187,17 +194,32 @@ export class AssignEmployeesToGatesDto {
     @IsInt({ each: true })
     employeeIds: number[];
 
-    @ApiProperty({ example: 1 })
-    @IsOptional()
-    @IsInt()
-    organizationId?: number;
+    @ApiProperty({
+        example: [ActionType.PHOTO, ActionType.CARD],
+        description: 'Sinxronizatsiya qilinishi kerak bo‘lgan credential turlari',
+        enum: ActionType,
+        isArray: true,
+    })
+    @IsArray()
+    @IsEnum(ActionType, { each: true })
+    credentialTypes: ActionType[];
 }
 
 export class QueryDeviceDto extends QueryDto {
-    @ApiPropertyOptional({ enum: DeviceType })
-    @IsEnum(DeviceType)
+    @ApiProperty({
+        example: [ActionType.PHOTO, ActionType.CARD],
+        enum: ActionType,
+        isArray: true,
+        required: false,
+    })
     @IsOptional()
-    type?: DeviceType;
+    @Transform(({ value }) => {
+        if (!value) return undefined;
+        return Array.isArray(value) ? value : [value];
+    })
+    @IsArray() // Endi har doim massiv kelishini tekshirish mumkin
+    @IsEnum(ActionType, { each: true })
+    deviceTypes?: ActionType[];
 
     @ApiPropertyOptional()
     @IsNumber()
@@ -210,4 +232,34 @@ export class QueryDeviceDto extends QueryDto {
     @IsOptional()
     @Type(() => Number)
     organizationId?: number;
+
+    @ApiProperty({
+        description: 'Filter by connection with gate',
+        type: Boolean,
+        required: false,
+        default: false,
+    })
+    @IsOptional()
+    @IsBoolean()
+    @Transform(({ value }) => (value === 'true' ? true : value === 'false' ? false : value))
+    isConnected?: boolean;
+}
+
+export class SyncCredentialsDto {
+    @ApiProperty()
+    @IsNumber()
+    gateId: number;
+
+    @ApiProperty()
+    @IsNumber()
+    employeeId: number;
+
+    @ApiProperty({
+        example: [5, 6, 7],
+        description: 'credentialIds ro‘yxati',
+        type: [Number],
+    })
+    @IsArray()
+    @IsInt({ each: true })
+    credentialIds: number[];
 }

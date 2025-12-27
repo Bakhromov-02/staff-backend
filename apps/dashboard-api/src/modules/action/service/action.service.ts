@@ -2,7 +2,14 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { ActionRepository } from '../repositories/action.repository';
 import { ActionQueryDto, CreateActionDto, UpdateActionDto } from '../dto/action.dto';
 import { PrismaService } from '@app/shared/database';
-import { ActionMode, ActionStatus, ActionType, Prisma, VisitorType } from '@prisma/client';
+import {
+    ActionMode,
+    ActionStatus,
+    ActionType,
+    EntryType,
+    Prisma,
+    VisitorType,
+} from '@prisma/client';
 import { AttendanceService } from '../../attendance/attendance.service';
 import { LoggerService } from 'apps/dashboard-api/src/core/logger';
 import { DataScope } from '@app/shared/auth';
@@ -11,7 +18,7 @@ import { CreateAttendanceDto } from '../../attendance/dto/attendance.dto';
 @Injectable()
 export class ActionService {
     constructor(
-        private readonly repo: ActionRepository,
+        private readonly actionRepo: ActionRepository,
         private readonly attendanceService: AttendanceService,
         private prisma: PrismaService,
         private readonly logger: LoggerService
@@ -22,31 +29,32 @@ export class ActionService {
             const acEvent =
                 eventData.AccessControllerEvent || eventData.EventNotificationAlert || {};
 
-            // subeventType: 75 - photo, 181 - personal code, 1 - card
+            // subeventType: 75 - photo, 181 - personal code, 1 - card+
+            const { CAR, CARD, PERSONAL_CODE, PHOTO } = ActionType;
 
             const actionTime = eventData.dateTime || acEvent.dateTime;
             const originalLicensePlate = acEvent?.ANPR?.originalLicensePlate || null;
 
             let actionType = originalLicensePlate
-                ? ActionType.CAR
+                ? CAR
                 : acEvent.subEventType == 181
-                ? ActionType.PERSONAL_CODE
+                ? PERSONAL_CODE
                 : acEvent.subEventType == 75
-                ? ActionType.PHOTO
+                ? PHOTO
                 : acEvent.subEventType == 1
-                ? ActionType.CARD
+                ? CARD
                 : null;
 
             let credentialId = null;
 
-            if (actionType == 'CAR' || actionType == 'CARD') {
+            if (actionType == CAR || actionType == CARD) {
                 const credential = await this.prisma.credential.findFirst({
                     where: { code: originalLicensePlate || acEvent?.cardNo, isActive: true },
                 });
                 credentialId = credential ? credential.id : null;
             }
 
-            if (actionType == 'PHOTO' || actionType == 'PERSONAL_CODE') {
+            if (actionType == PHOTO || actionType == PERSONAL_CODE) {
                 const credential = await this.prisma.credential.findFirst({
                     where: { employeeId, type: actionType, isActive: true },
                 });
@@ -72,6 +80,7 @@ export class ActionService {
             const plan = await this.prisma.employeePlan.findFirst({
                 where: { id: employee.employeePlanId },
             });
+
             if (!plan) throw new Error(`Employee plan ${employee.employeePlanId} not found`);
 
             const dto: CreateActionDto = {
@@ -81,7 +90,7 @@ export class ActionService {
                 employeeId,
                 visitorId: undefined,
                 visitorType:
-                    acEvent.userType === 'normal' || device.type === 'CAR'
+                    acEvent.userType === 'normal' || device.type.includes(ActionType.CAR)
                         ? VisitorType.EMPLOYEE
                         : VisitorType.VISITOR,
                 entryType: device.entryType,
@@ -101,7 +110,7 @@ export class ActionService {
             const todayEnd = new Date(actionTime);
             todayEnd.setHours(23, 59, 59, 999);
 
-            if (device.entryType === 'BOTH') {
+            if (device.entryType === EntryType.BOTH) {
                 const lastInfo = await this.getLastActionInfo(
                     employeeId,
                     organizationId,
@@ -116,14 +125,14 @@ export class ActionService {
                 dto.entryType = lastInfo.nextEntryType as any;
             }
 
-            if (dto.entryType === 'EXIT') {
+            if (dto.entryType === EntryType.EXIT) {
                 const { status: exitStatus, diffMinutes } = await this.getExitStatus(
                     actionTime,
                     plan.endTime
                 );
 
-                const existingAttendance = await this.prisma.attendance.findFirst({
-                    where: {
+                const existing = await this.attendanceService.findFirst(
+                    {
                         employeeId,
                         organizationId,
                         startTime: {
@@ -131,32 +140,29 @@ export class ActionService {
                             lte: todayEnd,
                         },
                     },
-                    orderBy: { startTime: 'desc' },
-                });
+                    { startTime: 'desc' }
+                );
 
-                if (existingAttendance) {
-                    await this.prisma.attendance.update({
-                        where: { id: existingAttendance.id },
-                        data: {
-                            endTime: actionTime,
-                            goneStatus: exitStatus,
-                            earlyGoneTime: diffMinutes,
-                        },
+                if (existing) {
+                    await this.attendanceService.update(existing.id, {
+                        endTime: actionTime,
+                        goneStatus: existing?.isWorkingDay ? exitStatus : 'ON_TIME',
+                        earlyGoneTime: existing?.isWorkingDay ? diffMinutes : 0,
                     });
                 } else {
                     this.logger.warn(`⚠️ Attendance NOT FOUND (EXIT): employee ${employeeId}`);
                 }
             }
 
-            if (dto.entryType === 'ENTER') {
+            if (dto.entryType === EntryType.ENTER) {
                 const { status, diffMinutes } = await this.getEnterStatus(
                     actionTime,
                     plan.startTime,
                     plan.extraTime
                 );
 
-                const existingAttendance = await this.prisma.attendance.findFirst({
-                    where: {
+                const existing = await this.attendanceService.findFirst(
+                    {
                         employeeId,
                         organizationId,
                         createdAt: {
@@ -164,11 +170,14 @@ export class ActionService {
                             lte: todayEnd,
                         },
                         AND: {
-                            OR: [{ arrivalStatus: 'PENDING' }, { arrivalStatus: 'ABSENT' }],
+                            OR: [
+                                { arrivalStatus: ActionStatus.PENDING },
+                                { arrivalStatus: ActionStatus.ABSENT },
+                            ],
                         },
                     },
-                    orderBy: { startTime: 'desc' },
-                });
+                    { startTime: 'desc' }
+                );
 
                 const data: CreateAttendanceDto = {
                     startTime: actionTime,
@@ -178,11 +187,13 @@ export class ActionService {
                     lateArrivalTime: diffMinutes,
                 };
 
-                if (existingAttendance) {
-                    await this.prisma.attendance.update({
-                        where: { id: existingAttendance.id },
-                        data,
+                if (existing) {
+                    await this.attendanceService.update(existing.id, {
+                        ...data,
+                        arrivalStatus: existing?.isWorkingDay ? status : 'ON_TIME',
+                        lateArrivalTime: existing?.isWorkingDay ? diffMinutes : 0,
                     });
+                    await this.attendanceService.update(existing.id, data);
                 } else {
                     await this.attendanceService.create(data);
                 }
@@ -190,33 +201,31 @@ export class ActionService {
                 await this.updatedGoneStatus(employeeId, organizationId, todayStart, todayEnd);
             }
 
-            return this.prisma.action.create({
-                data: {
-                    actionTime: dto.actionTime,
-                    visitorType: dto.visitorType,
-                    entryType: dto.entryType,
-                    actionType: dto.actionType,
-                    actionResult: dto.actionResult,
-                    actionMode: dto.actionMode,
+            return this.actionRepo.create({
+                actionTime: dto.actionTime,
+                visitorType: dto.visitorType,
+                entryType: dto.entryType,
+                actionType: dto.actionType,
+                actionResult: dto.actionResult,
+                actionMode: dto.actionMode,
 
-                    device: {
-                        connect: { id: deviceId },
-                    },
-                    gate: {
-                        connect: { id: gate.id },
-                    },
-                    employee: {
-                        connect: { id: employeeId },
-                    },
-                    organization: {
-                        connect: { id: organizationId },
-                    },
-                    credential: credentialId
-                        ? {
-                              connect: { id: credentialId },
-                          }
-                        : undefined,
+                device: {
+                    connect: { id: deviceId },
                 },
+                gate: {
+                    connect: { id: gate.id },
+                },
+                employee: {
+                    connect: { id: employeeId },
+                },
+                organization: {
+                    connect: { id: organizationId },
+                },
+                credential: credentialId
+                    ? {
+                          connect: { id: credentialId },
+                      }
+                    : undefined,
             });
         } catch (error) {
             this.logger.error(error);
@@ -225,7 +234,11 @@ export class ActionService {
     }
 
     async findOne(id: number, scope: DataScope) {
-        const action = await this.repo.findById(id, this.repo.getDefaultInclude(), scope);
+        const action = await this.actionRepo.findById(
+            id,
+            this.actionRepo.getDefaultInclude(),
+            scope
+        );
         if (!action) throw new NotFoundException(`Action ${id} not found`);
         return action;
     }
@@ -269,10 +282,10 @@ export class ActionService {
             lte: end,
         };
 
-        const actions = await this.repo.findMany(
+        const actions = await this.actionRepo.findMany(
             where,
             { [sort || 'actionTime']: order || 'asc' },
-            this.repo.getDefaultInclude(),
+            this.actionRepo.getDefaultInclude(),
             undefined,
             undefined,
             scope,
@@ -315,8 +328,8 @@ export class ActionService {
         gte: Date,
         lte: Date
     ) {
-        const existingAttendance = await this.prisma.attendance.findFirst({
-            where: {
+        const existing = await this.attendanceService.findFirst(
+            {
                 employeeId,
                 organizationId,
                 createdAt: {
@@ -324,17 +337,14 @@ export class ActionService {
                     lte,
                 },
             },
-            orderBy: { startTime: 'desc' },
-        });
+            { startTime: 'desc' }
+        );
 
-        if (existingAttendance) {
-            await this.prisma.attendance.update({
-                where: { id: existingAttendance.id },
-                data: {
-                    goneStatus: null,
-                    endTime: null,
-                    earlyGoneTime: null,
-                },
+        if (existing) {
+            await this.attendanceService.update(existing.id, {
+                goneStatus: null,
+                endTime: null,
+                earlyGoneTime: null,
             });
         }
         return;
@@ -405,16 +415,17 @@ export class ActionService {
     }
 
     async getLastActionInfo(employeeId: number, organizationId: number, gte: Date, lte: Date) {
-        const lastAction = await this.prisma.action.findFirst({
-            where: { employeeId, organizationId, actionTime: { gte, lte } },
-            orderBy: { actionTime: 'desc' },
-        });
+        const lastAction = await this.actionRepo.findFirst(
+            { employeeId, organizationId, actionTime: { gte, lte } },
+            { actionTime: 'desc' }
+        );
+        const { EXIT, ENTER } = EntryType;
 
         if (!lastAction) {
             return {
                 canCreate: true,
                 lastEntryType: null,
-                nextEntryType: 'ENTER',
+                nextEntryType: ENTER,
                 minutesSinceLast: null,
             };
         }
@@ -433,11 +444,7 @@ export class ActionService {
         }
 
         const nextEntryType =
-            lastAction.entryType === 'ENTER'
-                ? 'EXIT'
-                : lastAction.entryType === 'EXIT'
-                ? 'ENTER'
-                : 'ENTER';
+            lastAction.entryType === ENTER ? EXIT : lastAction.entryType === EXIT ? ENTER : ENTER;
 
         return {
             canCreate: true,

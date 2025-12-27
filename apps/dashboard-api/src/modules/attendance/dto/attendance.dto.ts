@@ -16,12 +16,12 @@ export class CreateAttendanceDto {
     @ApiProperty({ example: '2025-11-10T09:00:00.000Z' })
     @IsNotEmpty()
     @IsDateString()
-    startTime: string;
+    startTime: Date;
 
     @ApiPropertyOptional({ example: '2025-11-10T18:00:00.000Z' })
     @IsOptional()
     @IsDateString()
-    endTime?: string;
+    endTime?: Date;
 
     @ApiProperty({ example: 'ON_TIME' })
     @IsNotEmpty()
@@ -75,7 +75,7 @@ export class UpdateAttendanceDto {
     @IsOptional()
     @IsInt()
     @Type(() => Number)
-    reasonTypeId?: number;
+    reasonId?: number;
 
     @IsOptional()
     @IsDateString()
@@ -88,6 +88,18 @@ export class UpdateAttendanceDto {
     @IsOptional()
     @IsEnum(ActionStatus)
     goneStatus?: ActionStatus;
+
+    @IsOptional()
+    @IsEnum(ActionStatus)
+    arrivalStatus?: ActionStatus;
+
+    @IsOptional()
+    @IsInt()
+    earlyGoneTime?: number;
+
+    @IsOptional()
+    @IsInt()
+    lateArrivalTime?: number;
 }
 
 export class AttendanceQueryDto extends QueryDto {

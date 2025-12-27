@@ -26,6 +26,14 @@ export class EmployeePlanService {
         }
     }
 
+    async findFirst(employeeId: number) {
+        return this.repo.findFirst({
+            employees: {
+                some: { id: employeeId },
+            },
+        });
+    }
+
     async findAll(query: EmployeePlanQueryDto, scope: DataScope) {
         const where: any = {};
         if (query.isActive !== undefined) where.isActive = query.isActive;
