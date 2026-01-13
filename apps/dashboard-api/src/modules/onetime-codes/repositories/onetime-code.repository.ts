@@ -25,7 +25,7 @@ export class OnetimeCodeRepository extends BaseRepository<
     }
 
     async findByCode(code: string) {
-        return this.findFirst({ code });
+        return this.findFirst({ code, deletedAt: null });
     }
 
     async findByVisitorId(visitorId: number, include?: Prisma.OnetimeCodeInclude) {
@@ -34,21 +34,26 @@ export class OnetimeCodeRepository extends BaseRepository<
 
     async findActiveCodes(include?: Prisma.OnetimeCodeInclude) {
         const now = new Date();
-        return this.findMany({
-            isActive: true,
-            startDate: { lte: now },
-            endDate: { gte: now }
-        }, { createdAt: 'desc' }, include);
+        return this.findMany(
+            {
+                isActive: true,
+                startDate: { lte: now },
+                endDate: { gte: now },
+            },
+            { createdAt: 'desc' },
+            include
+        );
     }
 
     async findExpiredCodes(include?: Prisma.OnetimeCodeInclude) {
         const now = new Date();
-        return this.findMany({
-            OR: [
-                { endDate: { lt: now } },
-                { isActive: false }
-            ]
-        }, { createdAt: 'desc' }, include);
+        return this.findMany(
+            {
+                OR: [{ endDate: { lt: now } }, { isActive: false }],
+            },
+            { createdAt: 'desc' },
+            include
+        );
     }
 
     async findByCodeType(codeType: VisitorCodeType, include?: Prisma.OnetimeCodeInclude) {
@@ -68,23 +73,23 @@ export class OnetimeCodeRepository extends BaseRepository<
         const codeRecord = await this.findFirst({
             code,
             isActive: true,
+            deletedAt: null,
             startDate: { lte: now },
-            endDate: { gte: now }
+            endDate: { gte: now },
         });
 
         return !!codeRecord;
     }
 
     async generateUniqueCode(): Promise<string> {
-        const today = new Date();
-        const dateStr = today.toISOString().slice(0, 10).replace(/-/g, '');
-
         let attempts = 0;
         const maxAttempts = 100;
 
         while (attempts < maxAttempts) {
-            const randomNum = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
-            const code = `VIS${dateStr}${randomNum}`;
+            const randomNum = Math.floor(Math.random() * 10000)
+                .toString()
+                .padStart(5, '0');
+            const code = `vis${randomNum}`;
 
             const existing = await this.findByCode(code);
             if (!existing) {
@@ -95,7 +100,7 @@ export class OnetimeCodeRepository extends BaseRepository<
         }
 
         // Fallback with timestamp
-        const timestamp = Date.now().toString().slice(-4);
-        return `VIS${dateStr}${timestamp}`;
+        const timestamp = Date.now().toString().slice(-5);
+        return `vis${timestamp}`;
     }
 }

@@ -7,7 +7,7 @@ import {
     ChartStatsQueryDto,
     DashboardStats,
 } from './dto/dashboard.dto';
-import { DataScope, UserContext } from '@app/shared/auth';
+import { DataScope, Role, UserContext } from '@app/shared/auth';
 
 @Injectable()
 export class DashboardService {
@@ -28,8 +28,31 @@ export class DashboardService {
         const baseWhere: any = {
             deletedAt: null,
             ...(orgId ? { organizationId: orgId } : {}),
-            ...(depId.length > 0 ? { departmentId: { in: depId } } : {}),
+            ...(depId.length ? { departmentId: { in: depId } } : {}),
         };
+
+        if (user.role === Role.DEPARTMENT_LEAD) {
+            const [totalEmployees, newEmployeesCount] = await Promise.all([
+                this.prisma.employee.count({ where: baseWhere }),
+                this.prisma.employee.count({
+                    where: {
+                        ...baseWhere,
+                        createdAt: { gte: start, lte: end },
+                    },
+                }),
+            ]);
+
+            return {
+                totalEmployees,
+                newEmployeesCount,
+                totalDepartments: 0,
+                newDepartmentsCount: 0,
+                totalComputers: 0,
+                newComputersCount: 0,
+                totalOrganizations: 0,
+                newOrganizationsCount: 0,
+            };
+        }
 
         const [
             totalEmployees,

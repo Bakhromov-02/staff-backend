@@ -175,14 +175,15 @@ export class ConnectionDto {
     gateId: number; //
 }
 
-export class AssignEmployeesToGatesDto {
+export class AssignEmployeesToDevicesDto {
     @ApiProperty({
-        example: 1,
-        description: 'Gate ID (Bitta darvoza IDsi)',
-        type: Number,
+        example: [1, 2, 3],
+        description: 'Qurilmala IDlari ro‘yxati',
+        type: [Number],
     })
-    @IsInt()
-    gateId: number; // Nomini gateIds dan gateId ga o'zgartirdik (chunki u bitta son)
+    @IsArray()
+    @IsInt({ each: true })
+    deviceIds: number[];
 
     @ApiProperty({
         example: [5, 6, 7],
@@ -190,7 +191,6 @@ export class AssignEmployeesToGatesDto {
         type: [Number],
     })
     @IsArray()
-    @ArrayNotEmpty()
     @IsInt({ each: true })
     employeeIds: number[];
 

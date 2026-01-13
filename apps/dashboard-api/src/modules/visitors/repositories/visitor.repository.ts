@@ -20,6 +20,10 @@ export class VisitorRepository extends BaseRepository<
 
     protected readonly modelName = Prisma.ModelName.Visitor;
 
+    protected cascadeRelations = ['onetimeCodes', 'actions'];
+
+    protected disconnectRelations = ['gates'];
+
     protected getDelegate() {
         return this.prisma.visitor;
     }
@@ -69,22 +73,6 @@ export class VisitorRepository extends BaseRepository<
         });
     }
 
-    async findWithActiveCodes(include?: Prisma.VisitorInclude) {
-        return this.findMany(
-            {
-                onetimeCodes: {
-                    some: {
-                        isActive: true,
-                        startDate: { lte: new Date() },
-                        endDate: { gte: new Date() },
-                    },
-                },
-            },
-            undefined,
-            include
-        );
-    }
-
     async findWithActionCount(where?: Prisma.VisitorWhereInput) {
         return this.findMany(where, undefined, {
             _count: {
@@ -94,27 +82,5 @@ export class VisitorRepository extends BaseRepository<
                 },
             },
         });
-    }
-
-    async generateOnetimeCode(): Promise<string> {
-        const today = new Date();
-        const dateStr = today.toISOString().slice(0, 10).replace(/-/g, '');
-
-        // Get today's code count
-        const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-        const todayEnd = new Date(todayStart);
-        todayEnd.setDate(todayEnd.getDate() + 1);
-
-        const count = await this.prisma.onetimeCode.count({
-            where: {
-                createdAt: {
-                    gte: todayStart,
-                    lt: todayEnd,
-                },
-            },
-        });
-
-        const sequence = (count + 1).toString().padStart(4, '0');
-        return `VIS${dateStr}${sequence}`;
     }
 }

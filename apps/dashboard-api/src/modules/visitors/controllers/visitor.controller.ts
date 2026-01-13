@@ -1,21 +1,24 @@
 import { Controller, Get, Post, Put, Delete, Body, Param, Query } from '@nestjs/common';
-import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
-import { Roles, Role, User as CurrentUser, DataScope, Scope } from '@app/shared/auth';
+import { ApiTags, ApiBearerAuth, ApiExtraModels, ApiResponse } from '@nestjs/swagger';
+import { Roles, Role, User as CurrentUser, DataScope, Scope, User } from '@app/shared/auth';
 import { VisitorService } from '../services/visitor.service';
 import { UserContext } from 'apps/dashboard-api/src/shared/interfaces';
 import {
     CreateVisitorDto,
     VisitorWithRelationsDto,
     UpdateVisitorDto,
-    GenerateCodeDto,
-    CreateOnetimeCodeDto,
+    QueryVisitorDto,
+    VisitorDto,
+    AssignVisitorToGatesDto,
 } from '../dto/visitor.dto';
 import { ApiCrudOperation } from 'apps/dashboard-api/src/shared/utils';
 import { QueryDto } from 'apps/dashboard-api/src/shared/dto';
+import { ApiSuccessResponse } from '@app/shared/utils';
 
 @ApiTags('Visitors')
 @Controller('visitors')
 @ApiBearerAuth()
+@ApiExtraModels(ApiSuccessResponse, VisitorWithRelationsDto)
 export class VisitorController {
     constructor(private readonly visitorService: VisitorService) {}
 
@@ -27,14 +30,10 @@ export class VisitorController {
             pagination: true,
             search: true,
             sort: true,
-            filters: {
-                creatorId: Number,
-                isActive: Boolean,
-            },
         },
     })
     async findAll(
-        @Query() query: QueryDto,
+        @Query() query: QueryVisitorDto,
         @CurrentUser() user: UserContext,
         @Scope() scope: DataScope
     ) {
@@ -50,15 +49,6 @@ export class VisitorController {
         return await this.visitorService.findTodayVisitors();
     }
 
-    @Get('active-codes')
-    @Roles(Role.ADMIN, Role.HR, Role.DEPARTMENT_LEAD, Role.GUARD)
-    @ApiCrudOperation(VisitorWithRelationsDto, 'list', {
-        summary: 'Get visitors with active codes',
-    })
-    async findWithActiveCodes() {
-        return await this.visitorService.findWithActiveCodes();
-    }
-
     @Get(':id')
     @Roles(Role.ADMIN, Role.HR, Role.DEPARTMENT_LEAD, Role.GUARD)
     @ApiCrudOperation(VisitorWithRelationsDto, 'get', { summary: 'Get visitor by ID' })
@@ -72,8 +62,12 @@ export class VisitorController {
         body: CreateVisitorDto,
         summary: 'Create new visitor',
     })
-    async create(@Body() createVisitorDto: CreateVisitorDto, @Scope() scope: DataScope) {
-        return await this.visitorService.create(createVisitorDto, scope);
+    async create(
+        @Body() createVisitorDto: CreateVisitorDto,
+        @Scope() scope: DataScope,
+        @CurrentUser() user: UserContext
+    ) {
+        return await this.visitorService.create(createVisitorDto, scope, user);
     }
 
     @Put(':id')
@@ -105,21 +99,6 @@ export class VisitorController {
         await this.visitorService.remove(id, scope, user);
     }
 
-    @Post(':id/generate-code')
-    @Roles(Role.ADMIN, Role.HR)
-    @ApiCrudOperation(null, 'create', {
-        body: GenerateCodeDto,
-        summary: 'Generate onetime code for visitor',
-        errorResponses: { notFound: true, badRequest: true },
-    })
-    async generateCode(
-        @Param('id') id: number,
-        @Body() generateCodeDto: GenerateCodeDto,
-        @CurrentUser() user: UserContext
-    ) {
-        return await this.visitorService.generateCode(id, generateCodeDto, user);
-    }
-
     @Get(':id/actions')
     @Roles(Role.ADMIN, Role.HR, Role.DEPARTMENT_LEAD, Role.GUARD)
     @ApiCrudOperation(null, 'list', {
@@ -129,13 +108,16 @@ export class VisitorController {
         return await this.visitorService.getActions(id, user);
     }
 
-    @Get('validate-code/:code')
-    @Roles(Role.ADMIN, Role.HR, Role.DEPARTMENT_LEAD, Role.GUARD)
-    @ApiCrudOperation(null, 'get', {
-        summary: 'Validate visitor code',
-        errorResponses: { notFound: true, badRequest: true },
+    @Post('assign-visitors-to-gates')
+    @Roles(Role.ADMIN)
+    @ApiCrudOperation(VisitorWithRelationsDto, 'create', {
+        summary: 'Assign visitors to gate devices for facial access',
     })
-    async validateCode(@Param('code') code: string) {
-        return await this.visitorService.validateCode(code);
+    async assignEmployeesToGates(
+        @Body() dto: AssignVisitorToGatesDto,
+        @User() user: UserContext,
+        @Scope() scope: DataScope
+    ) {
+        return await this.visitorService.assignVisitorToGates(dto, scope, user);
     }
 }
